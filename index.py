@@ -22,6 +22,7 @@ Run:       python ingest.py     (once, and whenever files change)
            python index.py
 """
 import collections
+import csv
 import datetime
 import json
 import os
@@ -32,9 +33,11 @@ import sys
 import threading
 import webbrowser
 from pathlib import Path
+from tkinter import filedialog
 
 import customtkinter as ctk
 
+import ingest
 import llm
 import searchlib
 from searchlib import STOP
@@ -266,6 +269,9 @@ class App:
         self.q = queue.Queue()
         self._seq = 0                       # lets us ignore results from an older, slower search
         self._after = None
+        self._last_results = []             # most recently rendered results (for CSV export)
+        self._from_year = None              # active date filter lower bound
+        self._to_year = None                # active date filter upper bound
         self.catalog = searchlib.load_catalog()
 
         # --- top bar
@@ -282,6 +288,13 @@ class App:
         ctk.CTkLabel(top, text="Sort:").pack(side="left", padx=(12, 4))
         ctk.CTkOptionMenu(top, values=["Relevance", "Newest", "Oldest", "Name A\u2192Z", "Name Z\u2192A"],
                           variable=self.sort_var, width=130, height=40).pack(side="left")
+        # --- date range filter
+        ctk.CTkLabel(top, text="From:").pack(side="left", padx=(12, 4))
+        self.from_year_entry = ctk.CTkEntry(top, width=70, height=40, placeholder_text="YYYY")
+        self.from_year_entry.pack(side="left")
+        ctk.CTkLabel(top, text="To:").pack(side="left", padx=(6, 4))
+        self.to_year_entry = ctk.CTkEntry(top, width=70, height=40, placeholder_text="YYYY")
+        self.to_year_entry.pack(side="left")
         ctk.CTkLabel(top, text="Max:").pack(side="left", padx=(12, 4))
         self.n = ctk.StringVar(value="50")
         ctk.CTkOptionMenu(top, values=["10", "25", "50", "100", "All"], variable=self.n, width=80,
@@ -289,6 +302,9 @@ class App:
         ctk.CTkButton(top, text="Search", width=100, height=40, command=self.start,
                       font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=(12, 0))
         ctk.CTkButton(top, text="Reload", width=90, height=40, command=self.reload).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(top, text="Export CSV", width=100, height=40, command=self.export_csv).pack(side="left", padx=(8, 0))
+        self.reindex_btn = ctk.CTkButton(top, text="Re-index", width=90, height=40, command=self.reindex)
+        self.reindex_btn.pack(side="left", padx=(8, 0))
         # Load saved theme preference
         _prefs = {}
         try:
@@ -300,6 +316,10 @@ class App:
         ctk.set_appearance_mode("Dark" if self.is_dark else "Light")
         self.theme_btn = ctk.CTkButton(top, text="Light mode" if self.is_dark else "Dark mode", width=110, height=40, command=self.toggle_theme)
         self.theme_btn.pack(side="left", padx=(14, 0))
+
+        self.progress_bar = ctk.CTkProgressBar(root, width=400, mode="indeterminate")
+        self.progress_bar.pack(padx=16, pady=(2, 0))
+        self.progress_bar.pack_forget()  # hide initially
 
         self.status = ctk.CTkLabel(root, text="", anchor="w", text_color=MUTED)
         self.status.pack(fill="x", padx=16)
@@ -369,6 +389,79 @@ class App:
             return sorted(results, key=lambda r: (r.get("file_name") or "").lower(), reverse=True)
         return results  # Relevance: leave as-is
 
+    def _apply_date_filter(self, results, from_year, to_year):
+        """Keep rows whose _dt is None (unknown) or whose year falls within [from_year, to_year]."""
+        if from_year is None and to_year is None:
+            return results
+        filtered = []
+        for r in results:
+            dt = r.get("_dt")
+            if dt is None:
+                filtered.append(r)  # unknown date: never exclude
+            else:
+                if from_year is not None and dt.year < from_year:
+                    continue
+                if to_year is not None and dt.year > to_year:
+                    continue
+                filtered.append(r)
+        return filtered
+
+    def export_csv(self):
+        """Export the most recently rendered results to a CSV file chosen by the user."""
+        if not self._last_results:
+            self.status.configure(text="Nothing to export yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="search_results.csv",
+            title="Save results as CSV",
+        )
+        if not path:
+            return  # user cancelled
+        # Columns to export — skip internal datetime objects (_dt); keep other underscored fields
+        export_cols = ["file_name", "doc_type", "size_bytes", "modified", "summary",
+                       "keywords", "relative_path", "_score", "_snippet"]
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=export_cols, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(self._last_results)
+            fname = Path(path).name
+            self.status.configure(text=f"Exported {len(self._last_results)} results to {fname}")
+        except Exception as exc:  # noqa: BLE001
+            self.status.configure(text=f"Export failed: {exc}")
+
+    def _ingest_log(self, msg):
+        """Called by ingest.ingest() on each file; posts status updates to the GUI queue."""
+        self.q.put(lambda m=msg: self.status.configure(text=f"Re-indexing: {m}"))
+
+    def reindex(self):
+        """Run ingest.ingest() in a background thread and show progress."""
+        self.reindex_btn.configure(state="disabled")
+        self.progress_bar.pack(padx=16, pady=(2, 0))
+        self.progress_bar.start()
+        self.status.configure(text="Re-indexing… (this may take a while)")
+        threading.Thread(target=self._run_reindex, daemon=True).start()
+
+    def _run_reindex(self):
+        try:
+            rows, _stats = ingest.ingest(use_ai=True, log=self._ingest_log)
+            n = len(rows)
+            self.q.put(lambda: self._reindex_done(n, None))
+        except Exception as exc:  # noqa: BLE001
+            self.q.put(lambda e=exc: self._reindex_done(0, e))
+
+    def _reindex_done(self, n, exc):
+        self.progress_bar.stop()
+        self.progress_bar.pack_forget()
+        self.reindex_btn.configure(state="normal")
+        if exc is not None:
+            self.status.configure(text=f"Re-index failed: {exc}")
+        else:
+            self.reload()
+            self.status.configure(text=f"Re-index complete: {n} file(s) indexed.")
+
     def _refresh_types(self):
         types = sorted({r.get("doc_type") for r in self.catalog if r.get("doc_type")})
         self.type_menu.configure(values=[self.ALL_TYPES] + types)
@@ -413,12 +506,28 @@ class App:
             return
         kw = self.entry.get().strip()
         doc_type = None if self.type_var.get() == self.ALL_TYPES else self.type_var.get()
+        # read date range filter values
+        from_y = self.from_year_entry.get().strip()
+        to_y = self.to_year_entry.get().strip()
+        try:
+            self._from_year = int(from_y) if from_y else None
+        except ValueError:
+            self._from_year = None
+        try:
+            self._to_year = int(to_y) if to_y else None
+        except ValueError:
+            self._to_year = None
         self._seq += 1
-        threading.Thread(target=self.run, args=(self._seq, kw, self._limit(), doc_type), daemon=True).start()
+        threading.Thread(
+            target=self.run,
+            args=(self._seq, kw, self._limit(), doc_type, self._from_year, self._to_year),
+            daemon=True,
+        ).start()
 
-    def run(self, seq, kw, limit, doc_type):
+    def run(self, seq, kw, limit, doc_type, from_year=None, to_year=None):
         try:
             results = searchlib.search_documents(self.catalog, kw, limit, doc_type)
+            results = self._apply_date_filter(results, from_year, to_year)
             results = self._apply_sort(results)
         except Exception as exc:  # noqa: BLE001 - keep the GUI alive, show the reason
             self.q.put(lambda: self.status.configure(text=f"Search failed: {exc}"))
@@ -458,10 +567,17 @@ class App:
 
     # --- rendering
     def render(self, kw, results):
+        self._last_results = list(results)
         total = len(self.catalog)
         header = "all documents" if not kw else f'"{kw}"'
         note = "  ·  showing documents that contain ANY of your words" if results and results[0].get("_match") == "any" else ""
-        self.status.configure(text=f"{len(results)} result(s) for {header} · {total} documents in catalog{note}")
+        # date filter note
+        date_note = ""
+        if self._from_year is not None or self._to_year is not None:
+            from_s = str(self._from_year) if self._from_year is not None else "…"
+            to_s = str(self._to_year) if self._to_year is not None else "…"
+            date_note = f"  ·  filtered to {from_s}–{to_s}"
+        self.status.configure(text=f"{len(results)} result(s) for {header} · {total} documents in catalog{note}{date_note}")
         for f in self.frames.values():
             clear(f)
         self.render_documents(results)
