@@ -1,0 +1,14 @@
+# Core (GUI + search)
+customtkinter>=5.2,<6
+
+# File readers used by ingest.py - install what you need
+pdfplumber>=0.10,<1          # PDFs
+openpyxl>=3.1,<4             # .xlsx / .xlsm
+python-docx>=1.0,<2          # .docx
+xlrd>=2.0,<3                 # old .xls (optional)
+
+# Optional extras
+python-dotenv>=1.0,<2        # load API keys from a .env file
+groq>=0.9                    # AI keywords / answers via Groq (1.x already released)
+google-genai>=1.0,<2         # AI keywords / answers via Gemini
+easyocr>=1.7,<2              # OCR for images (large download; pulls in torch)
