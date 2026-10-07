@@ -1,0 +1,24 @@
+# Secrets - never commit API keys or credentials
+.env
+service_account.json
+credentials.json
+token.json
+
+# Python / editors
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Generated files (rebuilt by ingest.py)
+search_index.db
+data.csv
+probe.txt
+run.txt
+.ingest-*.csv
+
+# YOUR DOCUMENTS ARE PRIVATE - keep them out of git (only the folder's README is tracked)
+information/*
+!information/README.txt

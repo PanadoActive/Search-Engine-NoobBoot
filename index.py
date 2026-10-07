@@ -422,14 +422,22 @@ class App:
         self._folder_filter = p.get("folder_filter") or None
 
     def _save_prefs(self):
-        """Write all prefs keys atomically."""
+        """Write all prefs keys atomically (mkstemp + os.replace avoids partial writes)."""
+        import tempfile
+        data = json.dumps({
+            "dark_mode":      self.is_dark,
+            "search_history": self._history[:20],
+            "folder_filter":  self._folder_filter,
+        })
         try:
-            with open(PREFS_FILE, "w", encoding="utf-8") as f:
-                json.dump({
-                    "dark_mode":      self.is_dark,
-                    "search_history": self._history[:20],
-                    "folder_filter":  self._folder_filter,
-                }, f)
+            fd, tmp = tempfile.mkstemp(dir=PREFS_FILE.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(data)
+            except Exception:
+                os.unlink(tmp)
+                raise
+            os.replace(tmp, PREFS_FILE)
         except Exception:
             pass
 
@@ -578,6 +586,8 @@ class App:
         btn_all.pack(fill="x", padx=4, pady=(4, 2))
 
         # Walk INFORMATION_DIR for subdirectories
+        # Normalise rel_str to forward slashes so it matches the normalised comparison
+        # in run() regardless of OS or the OS that originally wrote data.csv.
         subdirs = []
         if INFORMATION_DIR.exists():
             for dirpath, dirnames, _ in os.walk(INFORMATION_DIR):
@@ -586,7 +596,8 @@ class App:
                 if rel == Path("."):
                     continue   # skip root itself
                 depth = len(rel.parts)
-                subdirs.append((str(rel), depth))
+                rel_str = str(rel).replace("\\", "/")  # forward-slash normalisation
+                subdirs.append((rel_str, depth))
 
         if not subdirs:
             label(self._sidebar, "No subfolders yet.", 11, MUTED).pack(anchor="w", padx=8, pady=4)
@@ -594,10 +605,11 @@ class App:
 
         for rel_str, depth in subdirs:
             indent = "  " * depth
-            is_selected = self._folder_filter == rel_str
+            norm_filter = (self._folder_filter or "").replace("\\", "/")
+            is_selected = norm_filter == rel_str and self._folder_filter is not None
             btn = ctk.CTkButton(
                 self._sidebar,
-                text=indent + Path(rel_str).name,
+                text=indent + rel_str.split("/")[-1],
                 anchor="w",
                 fg_color=("gray75", "gray35") if is_selected else "transparent",
                 command=lambda r=rel_str: self._set_folder(r),
@@ -607,7 +619,8 @@ class App:
 
     def _set_folder(self, rel):
         """Select a folder filter and trigger a new search."""
-        self._folder_filter = rel
+        # Store normalised forward-slash path (or None for "all")
+        self._folder_filter = rel.replace("\\", "/") if rel is not None else None
         self._save_prefs()
         self._build_sidebar()   # refresh highlight
         self.start()
@@ -687,10 +700,17 @@ class App:
         try:
             results = searchlib.search_documents(self.catalog, kw, limit, doc_type)
             results = self._apply_date_filter(results, from_year, to_year)
-            # Apply folder filter
+            # Apply folder filter (normalise separators; guard against prefix collision)
             if folder_filter is not None:
-                results = [r for r in results
-                           if r.get("relative_path", "").startswith(folder_filter)]
+                # Normalise to forward slashes so comparison works regardless of OS or
+                # which OS originally wrote data.csv.
+                norm_filter = folder_filter.replace("\\", "/").rstrip("/")
+                prefix = norm_filter + "/"
+                results = [
+                    r for r in results
+                    if r.get("relative_path", "").replace("\\", "/") == norm_filter
+                    or r.get("relative_path", "").replace("\\", "/").startswith(prefix)
+                ]
             results = self._apply_sort(results)
         except Exception as exc:  # noqa: BLE001 - keep the GUI alive, show the reason
             self.q.put(lambda: self.status.configure(text=f"Search failed: {exc}"))
@@ -812,14 +832,15 @@ class App:
                     if first_index is None:
                         first_index = start
 
+        # Scroll to the first highlighted term BEFORE disabling (see() is a no-op when disabled)
+        if first_index:
+            self.viewer_box.see(first_index)
+
         self.viewer_box.configure(state="disabled")
         self.viewer_title.configure(text=row.get("file_name", ""))
 
         # Show the viewer pane at the bottom of the Documents tab
         self.viewer_frame.pack(fill="x", side="bottom")
-
-        if first_index:
-            self.viewer_box.see(first_index)
 
     def _close_viewer(self):
         """Hide the built-in viewer pane."""
