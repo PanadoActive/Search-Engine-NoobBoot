@@ -274,6 +274,15 @@ class App:
         self._to_year = None                # active date filter upper bound
         self.catalog = searchlib.load_catalog()
 
+        # New state attributes
+        self._current_query: str = ""
+        self._folder_buttons: dict = {}     # keyed by relative folder path
+
+        # Load all preferences (sets self.is_dark, self._history, self._folder_filter)
+        self._load_prefs()
+
+        ctk.set_appearance_mode("Dark" if self.is_dark else "Light")
+
         # --- top bar
         top = ctk.CTkFrame(root, fg_color="transparent")
         top.pack(fill="x", padx=12, pady=(12, 4))
@@ -281,6 +290,9 @@ class App:
                                   placeholder_text='Search inside your documents…  ("exact phrase", type:pdf)')
         self.entry.pack(side="left", fill="x", expand=True)
         self.entry.bind("<Return>", lambda e: self.start())
+        # Bind focus events for history dropdown
+        self.entry.bind("<FocusIn>",  lambda e: self._show_history())
+        self.entry.bind("<FocusOut>", lambda e: self.root.after(200, self._hide_history))
         self.type_var = ctk.StringVar(value=self.ALL_TYPES)
         self.type_menu = ctk.CTkOptionMenu(top, values=[self.ALL_TYPES], variable=self.type_var, width=130, height=40)
         self.type_menu.pack(side="left", padx=(12, 0))
@@ -305,17 +317,13 @@ class App:
         ctk.CTkButton(top, text="Export CSV", width=100, height=40, command=self.export_csv).pack(side="left", padx=(8, 0))
         self.reindex_btn = ctk.CTkButton(top, text="Re-index", width=90, height=40, command=self.reindex)
         self.reindex_btn.pack(side="left", padx=(8, 0))
-        # Load saved theme preference
-        _prefs = {}
-        try:
-            with open(PREFS_FILE, encoding="utf-8") as _f:
-                _prefs = json.load(_f)
-        except Exception:
-            pass
-        self.is_dark = bool(_prefs.get("dark_mode", False))
-        ctk.set_appearance_mode("Dark" if self.is_dark else "Light")
         self.theme_btn = ctk.CTkButton(top, text="Light mode" if self.is_dark else "Dark mode", width=110, height=40, command=self.toggle_theme)
         self.theme_btn.pack(side="left", padx=(14, 0))
+
+        # --- history dropdown (hidden initially; shown on search entry FocusIn)
+        self.history_frame = ctk.CTkScrollableFrame(root, height=150, fg_color=("gray95", "gray20"))
+        self.history_frame.pack(fill="x", padx=12, pady=(0, 0))
+        self.history_frame.pack_forget()  # hidden initially
 
         self.progress_bar = ctk.CTkProgressBar(root, width=400, mode="indeterminate")
         self.progress_bar.pack(padx=16, pady=(2, 0))
@@ -324,9 +332,16 @@ class App:
         self.status = ctk.CTkLabel(root, text="", anchor="w", text_color=MUTED)
         self.status.pack(fill="x", padx=16)
 
-        # --- tabs
-        self.tabs = ctk.CTkTabview(root)
-        self.tabs.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        # --- horizontal split: sidebar (left) + tabs (right)
+        self._split = ctk.CTkFrame(root, fg_color="transparent")
+        self._split.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+
+        self._sidebar = ctk.CTkScrollableFrame(self._split, width=200, label_text="Folders")
+        self._sidebar.pack(side="left", fill="y", padx=(0, 4))
+
+        self.tabs = ctk.CTkTabview(self._split)
+        self.tabs.pack(side="left", fill="both", expand=True)
+
         self.frames, self.texts = {}, {}
 
         ask_tab = self.tabs.add("Ask")
@@ -345,10 +360,36 @@ class App:
         self.ask_sources = ctk.CTkScrollableFrame(ask_tab, fg_color="transparent")
         self.ask_sources.pack(fill="both", expand=True, padx=2)
 
-        for name in ("Documents", "By Type", "Keywords"):
+        # --- Documents tab: vertical split (results list top + viewer pane bottom)
+        doc_tab = self.tabs.add("Documents")
+        self.frames["Documents"] = ctk.CTkScrollableFrame(doc_tab, fg_color="transparent")
+        self.frames["Documents"].pack(fill="both", expand=True)
+
+        # Viewer pane (hidden initially)
+        self.viewer_frame = ctk.CTkFrame(doc_tab, fg_color=("gray90", "gray17"))
+        # Do NOT pack here — starts hidden
+
+        # Viewer header bar
+        viewer_header = ctk.CTkFrame(self.viewer_frame, fg_color="transparent")
+        viewer_header.pack(fill="x", padx=4, pady=(4, 0))
+        self.viewer_title = ctk.CTkLabel(viewer_header, text="", anchor="w",
+                                         font=ctk.CTkFont(size=13, weight="bold"))
+        self.viewer_title.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(viewer_header, text="✕", width=28, height=28,
+                      command=self._close_viewer).pack(side="right")
+
+        # Viewer textbox
+        self.viewer_box = ctk.CTkTextbox(self.viewer_frame, wrap="word",
+                                         font=ctk.CTkFont(family="Consolas", size=12))
+        self.viewer_box.pack(fill="both", expand=True, padx=4, pady=(2, 4))
+        self.viewer_box.configure(state="disabled")
+
+        # By Type and Keywords tabs (unchanged)
+        for name in ("By Type", "Keywords"):
             f = ctk.CTkScrollableFrame(self.tabs.add(name), fg_color="transparent")
             f.pack(fill="both", expand=True)
             self.frames[name] = f
+
         for name in ("SIMPLE", "ADVANCED"):
             t = ctk.CTkTextbox(self.tabs.add(name), wrap="word", font=ctk.CTkFont(family="Consolas", size=13))
             t.pack(fill="both", expand=True)
@@ -359,6 +400,8 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll()
         self._refresh_types()
+        self._build_sidebar()
+
         if not self.catalog:
             self.status.configure(text=f"No catalog loaded. Add files to '{INFORMATION_DIR.name}/' and run: python ingest.py")
         else:
@@ -366,16 +409,36 @@ class App:
             self.status.configure(text=f"{len(self.catalog)} documents in catalog.{note}")
             self.render("", self._apply_sort(searchlib.search_documents(self.catalog, "", self._limit())))
 
+    # --- preferences
+    def _load_prefs(self):
+        """Read PREFS_FILE once at startup; sets self.is_dark, self._history, self._folder_filter."""
+        try:
+            with open(PREFS_FILE, encoding="utf-8") as f:
+                p = json.load(f)
+        except Exception:
+            p = {}
+        self.is_dark        = bool(p.get("dark_mode", False))
+        self._history       = list(p.get("search_history", []))[:20]
+        self._folder_filter = p.get("folder_filter") or None
+
+    def _save_prefs(self):
+        """Write all prefs keys atomically."""
+        try:
+            with open(PREFS_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "dark_mode":      self.is_dark,
+                    "search_history": self._history[:20],
+                    "folder_filter":  self._folder_filter,
+                }, f)
+        except Exception:
+            pass
+
     # --- plumbing
     def toggle_theme(self):
         self.is_dark = not self.is_dark
         ctk.set_appearance_mode("Dark" if self.is_dark else "Light")
         self.theme_btn.configure(text="Light mode" if self.is_dark else "Dark mode")
-        try:
-            with open(PREFS_FILE, "w", encoding="utf-8") as _f:
-                json.dump({"dark_mode": self.is_dark}, _f)
-        except Exception:
-            pass
+        self._save_prefs()
 
     def _apply_sort(self, results):
         sort = self.sort_var.get()
@@ -473,6 +536,7 @@ class App:
     def reload(self):
         self.catalog = searchlib.load_catalog()
         self._refresh_types()
+        self._build_sidebar()
         self.start()
 
     def close(self):
@@ -499,12 +563,106 @@ class App:
         v = self.n.get()
         return None if v == "All" else int(v)
 
+    # --------------------------------------------------------------------------- Feature 1: Folder sidebar
+    def _build_sidebar(self):
+        """Rebuild the folder list in the left sidebar."""
+        clear(self._sidebar)
+        self._folder_buttons = {}
+
+        # "All folders" button at the top
+        btn_all = ctk.CTkButton(
+            self._sidebar, text="All folders", anchor="w",
+            fg_color=("gray75", "gray35") if self._folder_filter is None else "transparent",
+            command=lambda: self._set_folder(None),
+        )
+        btn_all.pack(fill="x", padx=4, pady=(4, 2))
+
+        # Walk INFORMATION_DIR for subdirectories
+        subdirs = []
+        if INFORMATION_DIR.exists():
+            for dirpath, dirnames, _ in os.walk(INFORMATION_DIR):
+                dirnames[:] = [d for d in sorted(dirnames) if not d.startswith(".")]
+                rel = Path(dirpath).relative_to(INFORMATION_DIR)
+                if rel == Path("."):
+                    continue   # skip root itself
+                depth = len(rel.parts)
+                subdirs.append((str(rel), depth))
+
+        if not subdirs:
+            label(self._sidebar, "No subfolders yet.", 11, MUTED).pack(anchor="w", padx=8, pady=4)
+            return
+
+        for rel_str, depth in subdirs:
+            indent = "  " * depth
+            is_selected = self._folder_filter == rel_str
+            btn = ctk.CTkButton(
+                self._sidebar,
+                text=indent + Path(rel_str).name,
+                anchor="w",
+                fg_color=("gray75", "gray35") if is_selected else "transparent",
+                command=lambda r=rel_str: self._set_folder(r),
+            )
+            btn.pack(fill="x", padx=4, pady=1)
+            self._folder_buttons[rel_str] = btn
+
+    def _set_folder(self, rel):
+        """Select a folder filter and trigger a new search."""
+        self._folder_filter = rel
+        self._save_prefs()
+        self._build_sidebar()   # refresh highlight
+        self.start()
+
+    # --------------------------------------------------------------------------- Feature 2: Search history
+    def _build_history_frame(self):
+        """Rebuild the contents of the history dropdown."""
+        clear(self.history_frame)
+        if not self._history:
+            return
+        for q in self._history:
+            def _pick(query=q):
+                self.entry.delete(0, "end")
+                self.entry.insert(0, query)
+                self._hide_history()
+                self.start()
+            btn = ctk.CTkButton(
+                self.history_frame, text=q, anchor="w",
+                fg_color="transparent", hover_color=("gray80", "gray30"),
+                command=_pick,
+            )
+            btn.pack(fill="x", padx=4, pady=1)
+        # Clear history button at the bottom
+        ctk.CTkButton(
+            self.history_frame, text="✕  Clear history", anchor="w",
+            fg_color="transparent", text_color=MUTED,
+            command=self._clear_history,
+        ).pack(fill="x", padx=4, pady=(4, 2))
+
+    def _show_history(self):
+        if not self._history:
+            return
+        self._build_history_frame()
+        self.history_frame.pack(fill="x", padx=12, pady=(0, 0))
+
+    def _hide_history(self):
+        self.history_frame.pack_forget()
+
+    def _clear_history(self):
+        self._history = []
+        self._save_prefs()
+        self._hide_history()
+
     # --- search
     def start(self):
         if not self.catalog:
             self.status.configure(text=f"No catalog. Run: python ingest.py (reads {INFORMATION_DIR.name}/).")
             return
         kw = self.entry.get().strip()
+        # Update current query and maintain history
+        self._current_query = kw
+        if kw and (not self._history or self._history[0] != kw):
+            self._history.insert(0, kw)
+            self._history = self._history[:20]
+            self._save_prefs()
         doc_type = None if self.type_var.get() == self.ALL_TYPES else self.type_var.get()
         # read date range filter values
         from_y = self.from_year_entry.get().strip()
@@ -518,16 +676,21 @@ class App:
         except ValueError:
             self._to_year = None
         self._seq += 1
+        folder_filter = self._folder_filter
         threading.Thread(
             target=self.run,
-            args=(self._seq, kw, self._limit(), doc_type, self._from_year, self._to_year),
+            args=(self._seq, kw, self._limit(), doc_type, self._from_year, self._to_year, folder_filter),
             daemon=True,
         ).start()
 
-    def run(self, seq, kw, limit, doc_type, from_year=None, to_year=None):
+    def run(self, seq, kw, limit, doc_type, from_year=None, to_year=None, folder_filter=None):
         try:
             results = searchlib.search_documents(self.catalog, kw, limit, doc_type)
             results = self._apply_date_filter(results, from_year, to_year)
+            # Apply folder filter
+            if folder_filter is not None:
+                results = [r for r in results
+                           if r.get("relative_path", "").startswith(folder_filter)]
             results = self._apply_sort(results)
         except Exception as exc:  # noqa: BLE001 - keep the GUI alive, show the reason
             self.q.put(lambda: self.status.configure(text=f"Search failed: {exc}"))
@@ -594,7 +757,13 @@ class App:
         label(f, meta, 11, PATH_GREEN).pack(anchor="w")
         head = ctk.CTkFrame(f, fg_color="transparent")
         head.pack(anchor="w", fill="x")
-        clickable(head, prefix + r.get("file_name", "(unnamed)"), lambda row=r: self._open(row)).pack(side="left")
+        # Feature 3: open txt/md files in the built-in viewer; all others with OS default
+        ext = Path(r.get("file_name", "")).suffix.lower()
+        if ext in (".txt", ".md"):
+            title_cb = lambda row=r: self._open_viewer(row)
+        else:
+            title_cb = lambda row=r: self._open(row)
+        clickable(head, prefix + r.get("file_name", "(unnamed)"), title_cb).pack(side="left")
         clickable(head, "show in folder", lambda row=r: self._reveal(row), size=11, color=MUTED).pack(side="left", padx=12)
         if r.get("_snippet"):
             label(f, "…" + r["_snippet"] + "…", 13).pack(anchor="w")
@@ -612,6 +781,49 @@ class App:
     def _reveal(self, row):
         if not reveal_file(row):
             self.status.configure(text=f"Could not find: {resolve_path(row)}")
+
+    # --------------------------------------------------------------------------- Feature 3: Text viewer pane
+    def _open_viewer(self, row):
+        """Open a text/markdown file in the built-in viewer pane."""
+        path = resolve_path(row)
+        if not path.exists():
+            self.status.configure(text=f"File not found: {path}")
+            return
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:50_000]
+        except Exception as exc:
+            self.status.configure(text=f"Could not read file: {exc}")
+            return
+
+        self.viewer_box.configure(state="normal")
+        self.viewer_box.delete("1.0", "end")
+        self.viewer_box.insert("end", text)
+
+        # Highlight current query terms
+        self.viewer_box.tag_config("highlight", background="#fff176", foreground="#000000")
+        first_index = None
+        if self._current_query:
+            terms = [w for w in re.findall(r"\w+", self._current_query) if len(w) >= 2]
+            for term in terms:
+                for m in re.finditer(re.escape(term), text, re.IGNORECASE):
+                    start = f"1.0 + {m.start()} chars"
+                    end   = f"1.0 + {m.end()} chars"
+                    self.viewer_box.tag_add("highlight", start, end)
+                    if first_index is None:
+                        first_index = start
+
+        self.viewer_box.configure(state="disabled")
+        self.viewer_title.configure(text=row.get("file_name", ""))
+
+        # Show the viewer pane at the bottom of the Documents tab
+        self.viewer_frame.pack(fill="x", side="bottom")
+
+        if first_index:
+            self.viewer_box.see(first_index)
+
+    def _close_viewer(self):
+        """Hide the built-in viewer pane."""
+        self.viewer_frame.pack_forget()
 
     def render_documents(self, results):
         p = self.frames["Documents"]
