@@ -60,6 +60,23 @@ def classify(ext: str) -> str:
     return "Other"
 
 
+def infer_category(filename: str, text: str) -> str:
+    combined = (filename + " " + text[:200]).lower()
+    if re.search(r"\bsop\b|standard operating proc", combined):
+        return "SOP"
+    if re.search(r"\bcircular\b|\bsurat pekeliling\b|\bsurat edaran\b", combined):
+        return "Circular"
+    if re.search(r"\bpolicy\b|\bpolicies\b|\bdasar\b", combined):
+        return "Policy"
+    if re.search(r"\bguideline\b|\bguidelines\b|\bpanduan\b|\bgaris panduan\b", combined):
+        return "Guideline"
+    if re.search(r"\breport\b|\breports\b|\blaporan\b", combined):
+        return "Report"
+    if re.search(r"\bminutes\b|\bmeeting minutes\b|\bminit mesyuarat\b|\bminit\b", combined):
+        return "Minutes"
+    return "Other"
+
+
 def summarize_text(text: str) -> str:
     """Reduce extracted text to a single representative sentence."""
     if not text:
@@ -341,7 +358,13 @@ def ingest(root=INFORMATION_DIR, out=CSV_FILE, db=DB_FILE, use_ai=True, rebuild=
             cached = cache.get(rel)
 
             if _cache_hit(cached, stat) and searchlib.is_current(conn, rel, stat.st_size, stamp):
-                rows.append(dict(cached, doc_id=doc_id))
+                row = dict(cached, doc_id=doc_id)
+                if not row.get("category"):
+                    row["category"] = infer_category(
+                        os.path.basename(path),
+                        cached.get("summary", "") + " " + cached.get("keywords", "")
+                    )
+                rows.append(row)
                 stats["reused"] += 1
                 continue
 
@@ -356,10 +379,11 @@ def ingest(root=INFORMATION_DIR, out=CSV_FILE, db=DB_FILE, use_ai=True, rebuild=
             stats["keywords: " + method] += 1
             stats["extracted ok" if status in CACHEABLE_STATUS else "problems"] += 1
 
+            category = infer_category(os.path.basename(path), text)
             rows.append({"doc_id": doc_id, "file_name": os.path.basename(path), "relative_path": rel,
                          "doc_type": classify(ext), "size_bytes": stat.st_size, "modified": stamp,
-                         "status": status, "summary": summary, "keywords": keywords})
-            title = f"{Path(path).stem.replace('_', ' ')} {keywords}"
+                         "status": status, "summary": summary, "keywords": keywords, "category": category})
+            title = f"{Path(path).stem.replace('_', ' ')} {keywords} {category}"
             searchlib.store(conn, rel, classify(ext), title, text, stat.st_size, stamp)
 
         stats["removed from index"] = searchlib.prune(conn, {r["relative_path"] for r in rows})

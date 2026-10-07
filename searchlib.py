@@ -208,6 +208,7 @@ def load_catalog(path=CSV_FILE) -> list[dict]:
         r["_dt"] = parse_dt(r.get("modified"))
         r["_date_s"] = fmt_dt(r["_dt"])
         r["_kw_list"] = [k.strip() for k in (r.get("keywords") or "").split(",") if k.strip()]
+        r["_category"] = r.get("category") or "Other"
     return rows
 
 

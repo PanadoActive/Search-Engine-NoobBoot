@@ -290,12 +290,22 @@ class App:
                                   placeholder_text='Search inside your documents…  ("exact phrase", type:pdf)')
         self.entry.pack(side="left", fill="x", expand=True)
         self.entry.bind("<Return>", lambda e: self.start())
+        # keyboard shortcuts
+        root.bind("<Control-f>", lambda e: self._focus_search())
+        root.bind("<Escape>",     lambda e: self._clear_search())
+        root.bind("<Control-r>", lambda e: self.reload())
+        root.bind("<Control-e>", lambda e: self.export_csv())
+        root.bind("<Control-Return>", lambda e: self.start())
         # Bind focus events for history dropdown
         self.entry.bind("<FocusIn>",  lambda e: self._show_history())
         self.entry.bind("<FocusOut>", lambda e: self.root.after(200, self._hide_history))
         self.type_var = ctk.StringVar(value=self.ALL_TYPES)
         self.type_menu = ctk.CTkOptionMenu(top, values=[self.ALL_TYPES], variable=self.type_var, width=130, height=40)
         self.type_menu.pack(side="left", padx=(12, 0))
+        self.cat_var = ctk.StringVar(value="All categories")
+        ctk.CTkOptionMenu(top, values=["All categories", "SOP", "Circular", "Policy",
+                                       "Guideline", "Report", "Minutes", "Other"],
+                          variable=self.cat_var, width=140, height=40).pack(side="left", padx=(8, 0))
         self.sort_var = ctk.StringVar(value="Relevance")
         ctk.CTkLabel(top, text="Sort:").pack(side="left", padx=(12, 4))
         ctk.CTkOptionMenu(top, values=["Relevance", "Newest", "Oldest", "Name A\u2192Z", "Name Z\u2192A"],
@@ -397,6 +407,8 @@ class App:
             self.texts[name] = t
         self.tabs.set("Documents")
 
+        ctk.CTkLabel(root, text="Ctrl+F: focus search  |  Esc: clear  |  Ctrl+R: reload  |  Ctrl+E: export  |  Ctrl+Enter: search",
+                     font=ctk.CTkFont(size=10), text_color=MUTED, anchor="e").pack(fill="x", padx=8, pady=(0, 4))
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll()
         self._refresh_types()
@@ -536,8 +548,6 @@ class App:
     def _refresh_types(self):
         types = sorted({r.get("doc_type") for r in self.catalog if r.get("doc_type")})
         self.type_menu.configure(values=[self.ALL_TYPES] + types)
-        types = sorted({r.get("doc_type") for r in self.catalog if r.get("doc_type")})
-        self.type_menu.configure(values=[self.ALL_TYPES] + types)
         if self.type_var.get() not in [self.ALL_TYPES] + types:
             self.type_var.set(self.ALL_TYPES)
 
@@ -664,6 +674,15 @@ class App:
         self._save_prefs()
         self._hide_history()
 
+    # --- search helpers
+    def _focus_search(self):
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+
+    def _clear_search(self):
+        self.entry.delete(0, "end")
+        self.start()
+
     # --- search
     def start(self):
         if not self.catalog:
@@ -690,13 +709,14 @@ class App:
             self._to_year = None
         self._seq += 1
         folder_filter = self._folder_filter
+        cat_filter = self.cat_var.get()
         threading.Thread(
             target=self.run,
-            args=(self._seq, kw, self._limit(), doc_type, self._from_year, self._to_year, folder_filter),
+            args=(self._seq, kw, self._limit(), doc_type, self._from_year, self._to_year, folder_filter, cat_filter),
             daemon=True,
         ).start()
 
-    def run(self, seq, kw, limit, doc_type, from_year=None, to_year=None, folder_filter=None):
+    def run(self, seq, kw, limit, doc_type, from_year=None, to_year=None, folder_filter=None, cat_filter=None):
         try:
             results = searchlib.search_documents(self.catalog, kw, limit, doc_type)
             results = self._apply_date_filter(results, from_year, to_year)
@@ -711,6 +731,8 @@ class App:
                     if r.get("relative_path", "").replace("\\", "/") == norm_filter
                     or r.get("relative_path", "").replace("\\", "/").startswith(prefix)
                 ]
+            if cat_filter and cat_filter != "All categories":
+                results = [r for r in results if r.get("_category", "Other") == cat_filter]
             results = self._apply_sort(results)
         except Exception as exc:  # noqa: BLE001 - keep the GUI alive, show the reason
             self.q.put(lambda: self.status.configure(text=f"Search failed: {exc}"))
@@ -773,8 +795,23 @@ class App:
     def _doc_card(self, parent, r, prefix=""):
         f = ctk.CTkFrame(parent, fg_color="transparent")
         f.pack(fill="x", anchor="w", padx=8, pady=6)
-        meta = " · ".join(x for x in (r.get("doc_type", ""), human_size(r.get("size_bytes")), r.get("_date_s", "")) if x)
-        label(f, meta, 11, PATH_GREEN).pack(anchor="w")
+        cat = r.get("_category", "")
+        cat_str = f"[{cat}]" if cat and cat != "Other" else ""
+        meta = " · ".join(x for x in (r.get("doc_type", ""), cat_str, human_size(r.get("size_bytes")), r.get("_date_s", "")) if x)
+        meta_row = ctk.CTkFrame(f, fg_color="transparent")
+        meta_row.pack(anchor="w")
+        label(meta_row, meta, 11, PATH_GREEN).pack(side="left")
+        if r.get("_dt"):
+            dt_today = datetime.date.today()
+            delta = (dt_today - r["_dt"].date()).days
+            if delta <= 30:
+                ctk.CTkLabel(meta_row, text="● NEW",
+                             text_color=("#1a7f37", "#81c995"),
+                             font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(8, 0))
+            elif delta <= 90:
+                ctk.CTkLabel(meta_row, text="● UPDATED",
+                             text_color=("#b45309", "#fbbf24"),
+                             font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(8, 0))
         head = ctk.CTkFrame(f, fg_color="transparent")
         head.pack(anchor="w", fill="x")
         # Feature 3: open txt/md files in the built-in viewer; all others with OS default

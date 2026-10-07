@@ -25,4 +25,4 @@ EXCEL_EXTS = {".xlsx", ".xlsm", ".xls"}
 TEXT_EXTS = {".txt", ".md", ".csv"}
 
 FIELDNAMES = ["doc_id", "file_name", "relative_path", "doc_type", "size_bytes",
-              "modified", "status", "summary", "keywords"]
+              "modified", "status", "summary", "keywords", "category"]
